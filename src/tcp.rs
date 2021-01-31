@@ -1,7 +1,7 @@
 use crate::packet::TCPPacket;
 use crate::socket::{SockID, Socket, TcpStatus};
 use crate::tcpflags;
-use anyhow::{Context, Result};
+use anyhow::{bail, Context, Result};
 use pnet::packet::{ip::IpNextHeaderProtocols, tcp::TcpPacket, Packet};
 use pnet::transport::{self, TransportChannelType};
 use rand::{rngs::ThreadRng, Rng};
@@ -20,20 +20,38 @@ const MSS: usize = 1460;
 const PORT_RANGE: Range<u16> = 40000..60000;
 
 struct TCP {
-    sockets: HashMap<SockID, Socket>,
+    sockets: RwLock<HashMap<SockID, Socket>>,
+    event_condvar: (Mutex<Option<TCPEvent>>, Condvar),
 }
 
 impl TCP {
-    pub fn new() -> Self {
-        let sockets = HashMap::new();
-        let tcp = Self { sockets };
+    pub fn new() -> Arc<Self> {
+        let sockets = RwLock::new(HashMap::new());
+        let tcp = Arc::new(Self {
+            sockets,
+            event_condvar: (Mutex::new(None), Condvar::new()),
+        });
+        let cloned_tcp = tcp.clone();
+        thread::spawn(move || {
+            // パケットの受信用スレッド
+            cloned_tcp.receive_handler().unwrap();
+        });
+
         tcp
     }
 
     pub fn select_unused_port(&self, rng: &mut ThreadRng) -> Result<u16> {
-        Ok(33445)
+        for _ in 0..(PORT_RANGE.end - PORT_RANGE.start) {
+            let local_port = rng.gen_range(PORT_RANGE);
+            let table = self.sockets.read().unwrap();
+            if table.keys().all(|k| local_port != k.2) {
+                return Ok(local_port);
+            }
+        }
+        anyhow::bail!("no available port found.");
     }
 
+    // ターゲットに接続し、接続済みソケットのIDを返す
     pub fn connect(&self, addr: Ipv4Addr, port: u16) -> Result<SockID> {
         let mut rng = rand::thread_rng();
         let mut socket = Socket::new(
@@ -41,9 +59,17 @@ impl TCP {
             addr,
             self.select_unused_port(&mut rng)?,
             port,
+            TcpStatus::SynSent,
         )?;
-        socket.send_tcp_packet(tcpflags::SYN, &[])?;
+        socket.send_param.initial_seq = rng.gen_range(1..1 << 31);
+        socket.send_tcp_packet(socket.send_param.initial_seq, 0, tcpflags::SYN, &[])?;
+        socket.send_param.unacked_seq = socket.send_param.initial_seq;
+        socket.send_param.next = socket.send_param.initial_seq + 1;
+        let mut table = self.sockets.write().unwrap();
         let sock_id = socket.get_sock_id();
+        table.insert(sock_id, socket);
+        drop(table);
+        self.wait_evnet(sock_id, TCPEventKind::ConnectionCompleted);
         Ok(sock_id)
     }
 

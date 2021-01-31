@@ -1,5 +1,5 @@
 use crate::tcpflags;
-use pnet::packet::{self, Packet, ip::IpNextHeaderProtocols, tcp::TcpPacket};
+use pnet::packet::{self, ip::IpNextHeaderProtocols, tcp::TcpPacket, Packet};
 use pnet::util;
 
 use std::net::Ipv4Addr;

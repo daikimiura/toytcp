@@ -11,6 +11,7 @@ use std::sync::{Arc, Condvar, Mutex, RwLock, RwLockWriteGuard};
 use std::time::{Duration, SystemTime};
 use std::{cmp, ops::Range, str, thread};
 use std::{collections::HashMap, u16};
+use transport::transport_channel;
 
 const UNDETERMINED_IP_ADDR: std::net::Ipv4Addr = Ipv4Addr::new(0, 0, 0, 0);
 const UNDETERMINED_PORT: u16 = 0;
@@ -74,6 +75,123 @@ impl TCP {
     }
 
     fn get_source_addr_to(addr: Ipv4Addr) -> Result<Ipv4Addr> {
-        Ok("10.0.0.1".parse().unwrap())
+        let output = Command::new("sh")
+            .arg("-c")
+            .arg(format!("ip route get {} | grep src", addr))
+            .output()?;
+
+        let mut output = str::from_utf8(&output.stdout)?
+            .trim()
+            .split_ascii_whitespace();
+        while let Some(s) = output.next() {
+            if s == "src" {
+                break;
+            }
+        }
+
+        let ip = output.next().context("failed to get src ip")?;
+        dbg!("source addr", ip);
+        ip.parse().context("failed to parse source ip");
+    }
+
+    fn receive_handler(&self) -> Result<()> {
+        dbg!("begin recv thread");
+        let (_, mut receiver) = transport::transport_channel(
+            65535,
+            TransportChannelType::Layer3(IpNextHeaderProtocols::Tcp),
+        )
+        .unwrap();
+
+        let mut packet_iter = transport::ipv4_packet_iter(&mut receiver);
+        loop {
+            let (packet, remote_addr) = match packet_iter.next() {
+                Ok((p, r)) => (p, r),
+                Err(_) => continue,
+            };
+            let local_addr = packet.get_destination();
+            let tcp_packet = match TcpPacket::new(packet.payload()) {
+                Some(p) => p,
+                None => {
+                    continue;
+                }
+            };
+
+            let packet = TCPPacket::from(tcp_packet);
+            let remote_addr = match remote_addr {
+                IpAddr::V4(addr) => addr,
+                _ => {
+                    continue;
+                }
+            };
+            let mut table = self.sockets.write().unwrap();
+            let socket = match table.get_mut(&SockID(
+                local_addr,
+                remote_addr,
+                packet.get_dest(),
+                packet.get_src(),
+            )) {
+                Some(socket) => socket, // 接続済みソケット
+                None => match table.get_mut(&SockID(
+                    local_addr,
+                    UNDETERMINED_IP_ADDR,
+                    packet.get_dest(),
+                    UNDETERMINED_PORT,
+                )) {
+                    Some(socket) => socket,
+                    None => continue,
+                },
+            };
+
+            if !packet.is_correct_checksum(local_addr, remote_addr) {
+                dbg!("invlaid checksum");
+                continue;
+            }
+            let sock_id = socket.get_sock_id();
+            if let Err(error) = match socket.status {
+                TcpStatus::SynSent => self.synsent_handler(socket, &packet),
+                _ => {
+                    dbg!("not implemented state");
+                    Ok(())
+                }
+            } {
+                dbg!(error);
+            }
+        }
+    }
+
+    fn synsent_handler(&self, socket: &mut Socket, packet: &TCPPacket) -> Result<()> {
+        dbg!("synsent handler");
+        if packet.get_flag() & tcpflags::ACK > 0
+            && socket.send_param.unacked_seq <= packet.get_ack()
+            && packet.get_ack() <= socket.send_param.next
+            && packet.get_flag() & tcpflags::SYN > 0
+        {
+            socket.recv_param.next = packet.get_seq() + 1;
+            socket.recv_param.initial_seq = packet.get_seq();
+            socket.send_param.unacked_seq = packet.get_ack();
+            socket.send_param.window = packet.get_window_size();
+            if socket.send_param.unacked_seq > socket.send_param.initial_seq {
+                socket.status = TcpStatus::Established;
+                socket.send_tcp_packet(
+                    socket.send_param.next,
+                    socket.recv_param.next,
+                    tcpflags::ACK,
+                    &[],
+                )?;
+
+                dbg!("status: synsent ->", &socket.status);
+                self.publish_event(socket.get_sock_id(), TCPEventKind::ConnectionCompleted);
+            } else {
+                socket.status = TcpStatus::SynRcvd;
+                socket.send_tcp_packet(
+                    socket.send_param.next,
+                    socket.recv_param.next,
+                    tcpflags::ACK,
+                    &[],
+                )?;
+                dbg!("status: synsent ->", &socket.status);
+            }
+            Ok(())
+        };
     }
 }
